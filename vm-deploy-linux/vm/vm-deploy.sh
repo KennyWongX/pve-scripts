@@ -18,7 +18,7 @@
 
 # --- Where build.func lives. Must match your repo layout. -------------------
 # Override at runtime:  REPO_RAW=https://... bash -c "$(curl ...)"
-REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/KennyWongX/vm-deploy-linux/master/vm-deploy-linux}"
+REPO_RAW="${REPO_RAW:-https://github.com/KennyWongX/pve-scripts/tree/master/vm-deploy-linux}"
 
 # --- OS catalog. Add a line here + a menu entry in prompt_os() to add an OS.
 #     Key = short id (no spaces), value = cloud image URL.
@@ -27,7 +27,6 @@ declare -A OS_URL=(
   [debian13]="https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2"
   [ubuntu2204]="https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img"
   [ubuntu2404]="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
-  [rocky9]="https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2"
 )
 
 # --- Prompt defaults (what's pre-filled in each whiptail box) ----------------
