@@ -70,7 +70,7 @@ from it.
 
 Manual cleanup:
 ```bash
-rm /var/lib/vz/template/iso/*.qcow2
+rm /var/lib/vz/template/iso/*.qcow2 /var/lib/vz/template/iso/*.img
 ```
 
 Automatic cleanup (prune anything unused for 90 days — add to `crontab -e`):
