@@ -79,21 +79,10 @@ SNIPPET_STORE="local:snippets"             # 'Snippets' content type enabled
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 
-# --- Load build.func without needing to know its exact path -----------------
-# Clones the repo once, finds build.func by name (any depth), sources it,
-# then deletes the clone - we only needed its contents in memory.
-command -v git >/dev/null 2>&1 || { echo "git is required. Install with: apt install -y git" >&2; exit 1; }
-
-_pve_tmp=$(mktemp -d)
-git clone --quiet --depth 1 --branch "$REPO_BRANCH" "$REPO_URL" "$_pve_tmp" 2>/dev/null || {
-  echo "Failed to clone ${REPO_URL} (branch: ${REPO_BRANCH})" >&2; rm -rf "$_pve_tmp"; exit 1
+# Process substitution, not a pipe - keeps stdin on the TTY for whiptail.
+source <(curl -fsSL "${REPO_RAW}/misc/build.func") || {
+  echo "Failed to load build.func from ${REPO_RAW}" >&2; exit 1
 }
-_pve_buildfunc=$(find "$_pve_tmp" -name build.func -print -quit)
-[[ -n "$_pve_buildfunc" ]] || { echo "build.func not found anywhere in ${REPO_URL}" >&2; rm -rf "$_pve_tmp"; exit 1; }
-
-source "$_pve_buildfunc" || { echo "Failed to source build.func" >&2; rm -rf "$_pve_tmp"; exit 1; }
-rm -rf "$_pve_tmp"
-unset _pve_tmp _pve_buildfunc
 
 # Answers collected by the prompt functions (globals by design - each
 # prompt_* fills its own, build_* reads them).
