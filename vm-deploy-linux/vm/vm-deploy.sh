@@ -2,26 +2,23 @@
 # ============================================================================
 # vm-deploy.sh - Interactive Proxmox VE VM builder (cloud-image based)
 #
-#   bash -c "$(curl -fsSL ${REPO_RAW}/vm/vm-deploy.sh)"
+# SINGLE-FILE, SELF-CONTAINED: helpers are inlined, nothing else is fetched.
+# Requires only bash + curl + whiptail (all present on a stock PVE install).
+#
+#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/KennyWongX/pve-scripts/master/vm-deploy-linux/vm/vm-deploy.sh)"
 #
 # Structure:
 #   [1] CONFIG      - everything you'd ever want to tweak lives here
-#   [2] PROMPTS     - one function per question group
-#   [3] BUILD       - one function per build stage
-#   [4] main        - just calls the functions in order
+#   [2] HELPERS     - shared functions (prompts, pickers, validators, rollback)
+#   [3] PROMPTS     - one function per question group
+#   [4] BUILD       - one function per build stage
+#   [5] main        - just calls the functions in order
 # ============================================================================
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ [1] CONFIG - edit this section, leave the rest alone                      ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
-
-# --- Where build.func lives. Must match your repo layout exactly. -----------
-# Override at runtime:  REPO_RAW=https://... bash -c "$(curl ...)"
-# NOTE: must be a raw.githubusercontent.com URL, never a github.com/.../tree/
-# URL - "tree" URLs return an HTML page, which curl will fetch as-is and bash
-# will then fail to parse as a script.
-REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/KennyWongX/pve-scripts/master/vm-deploy-linux}"
 
 # --- OS catalog. Add a line here + a menu entry in prompt_os() to add an OS.
 #     Key = short id (no spaces), value = cloud image URL.
@@ -79,9 +76,199 @@ SNIPPET_STORE="local:snippets"             # 'Snippets' content type enabled
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 
-# Process substitution, not a pipe - keeps stdin on the TTY for whiptail.
-source <(curl -fsSL "${REPO_RAW}/misc/build.func") || {
-  echo "Failed to load build.func from ${REPO_RAW}" >&2; exit 1
+
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║ SHARED HELPERS (inlined from build.func - single-file, no second fetch)   ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+
+# ----------------------------- output --------------------------------------
+RD=$'\033[01;31m'; GN=$'\033[1;92m'; YW=$'\033[33m'; BL=$'\033[36m'; CL=$'\033[m'
+CM="${GN}✓${CL}"; CROSS="${RD}✗${CL}"
+
+msg()  { echo -e " ${CM} ${GN}$*${CL}"; }
+info() { echo -e " ${BL}ℹ${CL} $*"; }
+warn() { echo -e " ${YW}⚠${CL} ${YW}$*${CL}"; }
+die()  { echo -e " ${CROSS} ${RD}$*${CL}" >&2; exit 1; }
+
+header_info() {
+  # header_info "Debian 12 VM"
+  clear
+  cat <<EOF
+${BL}
+  ╔═══════════════════════════════════════════╗
+  ║           PVE VM Deployment               ║
+  ╚═══════════════════════════════════════════╝
+${CL}
+  ${GN}${1:-}${CL}
+
+EOF
+}
+
+# ----------------------------- environment checks --------------------------
+init_pve() {
+  [[ $EUID -eq 0 ]] || die "Must run as root on the PVE host."
+  command -v qm       >/dev/null 2>&1 || die "'qm' not found - run this on a Proxmox VE node."
+  command -v pvesm    >/dev/null 2>&1 || die "'pvesm' not found - run this on a Proxmox VE node."
+  command -v whiptail >/dev/null 2>&1 || die "'whiptail' not found (apt install whiptail)."
+  command -v curl     >/dev/null 2>&1 || die "'curl' not found (apt install curl)."
+
+  local ver
+  ver=$(pveversion | grep -oP 'pve-manager/\K[0-9]+' || echo 0)
+  [[ "$ver" -ge 8 ]] || warn "Tested on PVE 8+. Detected major version: ${ver}."
+
+  # whiptail needs a real TTY. Catches the classic `curl ... | bash` mistake.
+  [[ -t 0 ]] || die "No TTY on stdin. Use: bash -c \"\$(curl -fsSL <url>)\" - not curl | bash"
+}
+
+# ----------------------------- rollback / trap -----------------------------
+# Any script that creates a VM sets VMID and flips VM_CREATED=1 immediately
+# after `qm create` succeeds. If the script then dies, we tear the VM down so
+# no orphaned/half-built VMIDs are left behind.
+VM_CREATED=0
+VMID=""
+
+_on_error() {
+  local rc=$?
+  [[ $rc -eq 0 ]] && exit 0
+  echo
+  warn "Script failed (exit ${rc})."
+  if [[ "$VM_CREATED" -eq 1 && -n "$VMID" ]]; then
+    warn "Rolling back partially-created VM ${VMID}..."
+    qm stop "$VMID" &>/dev/null || true
+    qm destroy "$VMID" --purge --destroy-unreferenced-disks 1 &>/dev/null \
+      && msg "VM ${VMID} removed." \
+      || warn "Could not fully remove VM ${VMID} - check manually."
+  fi
+  # The cloud-init snippet is written before `qm create` runs, so it can be
+  # orphaned even when VM_CREATED never got set. Safe to always attempt -
+  # rm -f is a no-op if it was never written or already cleaned up above.
+  if [[ -n "$VMID" && -f "/var/lib/vz/snippets/vendor-${VMID}.yaml" ]]; then
+    rm -f "/var/lib/vz/snippets/vendor-${VMID}.yaml" \
+      && msg "Removed leftover cloud-init snippet for ${VMID}." \
+      || warn "Could not remove snippet for ${VMID} - check manually."
+  fi
+  exit "$rc"
+}
+
+set_error_trap() {
+  set -euo pipefail
+  trap _on_error EXIT
+}
+
+# Call on success so the EXIT trap doesn't second-guess a clean finish.
+clear_error_trap() { trap - EXIT; }
+
+# ----------------------------- whiptail wrappers ---------------------------
+# Every prompt exits cleanly on Cancel/Esc instead of returning an empty string
+# that silently poisons a later qm call.
+ask() {
+  # ask "Title" "Prompt" "default" -> echoes the answer
+  local out
+  out=$(whiptail --title "$1" --inputbox "$2" 9 68 "${3:-}" 3>&1 1>&2 2>&3) || die "Cancelled."
+  [[ -n "$out" ]] || die "A value is required for: $2"
+  echo "$out"
+}
+
+ask_secret() {
+  local out
+  out=$(whiptail --title "$1" --passwordbox "$2" 9 68 3>&1 1>&2 2>&3) || die "Cancelled."
+  [[ -n "$out" ]] || die "A value is required for: $2"
+  echo "$out"
+}
+
+confirm() {
+  # confirm "Title" "Question" [defaultno]  -> returns 0 = yes, 1 = no
+  local extra=()
+  [[ "${3:-}" == "defaultno" ]] && extra+=(--defaultno)
+  whiptail --title "$1" --yesno "$2" 10 68 "${extra[@]}"
+}
+
+# ----------------------------- pickers -------------------------------------
+select_storage() {
+  # select_storage [content_type]  (default: images) -> echoes storage id
+  local content="${1:-images}" menu=() tag free
+  while read -r tag _ _ _ free _; do
+    [[ -n "$tag" ]] || continue
+    menu+=("$tag" "$(numfmt --from-unit=K --to=iec --format '%.1f' "$free" 2>/dev/null || echo '?') free")
+  done < <(pvesm status -content "$content" | awk 'NR>1 && $3=="active" {print $1, $2, $3, $4, $6, $7}')
+
+  [[ ${#menu[@]} -gt 0 ]] || die "No active storage with content type '${content}'."
+
+  # Only one option? Don't make the user click through a one-item menu.
+  if [[ ${#menu[@]} -eq 2 ]]; then
+    echo "${menu[0]}"
+    return
+  fi
+  whiptail --title "Storage" --menu "Select storage (content: ${content}):" 18 60 8 \
+    "${menu[@]}" 3>&1 1>&2 2>&3 || die "Cancelled."
+}
+
+select_bridge() {
+  # select_bridge "NIC 1" -> echoes vmbrX
+  # Shows IP + the PVE "Comment" field (Datacenter > Node > Network > Edit),
+  # so a bridge tagged e.g. "10Gbe Uplink" is identifiable without leaving the script.
+  local menu=() br ip comment desc node
+  node=$(hostname -s)
+
+  for br in $(find /sys/class/net -mindepth 1 -maxdepth 1 -name 'vmbr*' -printf '%f\n' | sort); do
+    ip=$(ip -4 -o addr show "$br" 2>/dev/null | awk '{print $4}' | paste -sd, -)
+    [[ -n "$ip" ]] || ip="no ip"
+
+    comment=""
+    if command -v pvesh >/dev/null 2>&1; then
+      comment=$(pvesh get "/nodes/${node}/network/${br}" --output-format json 2>/dev/null \
+        | perl -MJSON::PP -0777 -ne 'eval { print decode_json($_)->{comments} // ""; };' 2>/dev/null)
+      comment=${comment//$'\n'/ }   # flatten multi-line comments to one menu line
+    fi
+
+    desc="$ip"
+    [[ -n "$comment" ]] && desc="${ip}  |  ${comment}"
+    menu+=("$br" "$desc")
+  done
+
+  [[ ${#menu[@]} -gt 0 ]] || die "No vmbr bridges found. (Bonds must sit under a bridge to be used by a VM.)"
+  whiptail --title "${1:-Network}" --menu "Select bridge:" 18 74 8 \
+    "${menu[@]}" 3>&1 1>&2 2>&3 || die "Cancelled."
+}
+
+get_free_vmid() { pvesh get /cluster/nextid; }
+
+validate_vmid() {
+  [[ "$1" =~ ^[0-9]+$ ]] || die "VMID must be numeric: $1"
+  [[ "$1" -ge 100 ]]     || die "VMID must be >= 100."
+  qm status "$1" &>/dev/null && die "VMID $1 is already in use."
+  pct status "$1" &>/dev/null && die "VMID $1 is already used by a container."
+  return 0
+}
+
+validate_cidr() {
+  [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]] || die "Expected IP with CIDR (e.g. 10.0.10.50/24), got: $1"
+}
+
+validate_ip() {
+  [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || die "Expected a plain IP address, got: $1"
+}
+
+# ----------------------------- misc ----------------------------------------
+ensure_snippets() {
+  # Snippets content type must be enabled on 'local' for --cicustom to work.
+  pvesm status -content snippets 2>/dev/null | awk 'NR>1' | grep -q . \
+    || die "No storage has the 'Snippets' content type enabled.
+Enable it: Datacenter > Storage > local > Edit > Content > check Snippets."
+  mkdir -p /var/lib/vz/snippets
+}
+
+download_image() {
+  # download_image <url> <dest>  - caches, resumes, verifies non-empty
+  local url="$1" dest="$2"
+  if [[ -s "$dest" ]]; then
+    info "Using cached image: $(basename "$dest")"
+    return 0
+  fi
+  info "Downloading $(basename "$dest")..."
+  curl -fL --progress-bar -C - -o "$dest" "$url" || { rm -f "$dest"; die "Download failed: $url"; }
+  [[ -s "$dest" ]] || { rm -f "$dest"; die "Downloaded image is empty."; }
+  msg "Image ready."
 }
 
 # Answers collected by the prompt functions (globals by design - each
